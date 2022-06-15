@@ -1,5 +1,5 @@
 numpy==1.19.5
-ray==1.12.1
+ray[default]==1.13.0
 gym==0.15.7
 atari-py==0.2.6
 cython==0.29.23
@@ -7,3 +7,7 @@ tensorboard
 opencv-python
 kornia
 pydevd-pycharm~=221.5591.52
+opentelemetry-api==1.11.1
+opentelemetry-sdk==1.11.1
+opentelemetry-exporter-otlp==1.11.1
+opentelemetry-exporter-jaeger==1.11.1
