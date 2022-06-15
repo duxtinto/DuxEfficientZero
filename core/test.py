@@ -1,10 +1,13 @@
 import os
+from typing import Optional
+
 import ray
 import time
 import torch
 
 import numpy as np
 import core.ctree.cytree as cytree
+from opentelemetry.context import Context
 
 from tqdm.auto import tqdm
 from torch.cuda.amp import autocast as autocast
@@ -14,7 +17,7 @@ from core.utils import select_action, prepare_observation_lst
 
 
 @ray.remote
-def _test(config, shared_storage):
+def _test(config, shared_storage, _ray_trace_ctx: Optional[Context]):
     test_model = config.get_uniform_network()
     best_test_score = float('-inf')
     episodes = 0
