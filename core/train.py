@@ -1,25 +1,24 @@
+import copy
 import os
-import ray
 import time
-import torch
+from typing import Any, List
 
 import numpy as np
-import torch.optim as optim
+import ray
+import torch
 import torch.nn.functional as F
+import torch.optim as optim
+from numpy import ndarray
 from opentelemetry import trace
-from opentelemetry.propagate import inject
-
-from torch.nn import L1Loss
-from torch.cuda.amp import autocast as autocast
+from opentelemetry.trace import Status, StatusCode
+from ray.actor import ActorHandle
 from torch.cuda.amp import GradScaler as GradScaler
+from torch.cuda.amp import autocast as autocast
+from torch.nn import L1Loss
 
 from __refactored__.deploy.RayActors import RayActors
+from config.atari import EfficientZeroNet, AtariConfig
 from core.log import _log
-from core.test import _test
-from core.replay_buffer import ReplayBuffer
-from core.storage import SharedStorage, QueueStorage
-from core.selfplay_worker import DataWorker
-from core.reanalyze_worker import BatchWorker_GPU, BatchWorker_CPU
 
 
 def consist_loss_func(f1, f2):
@@ -45,7 +44,15 @@ def adjust_lr(config, optimizer, step_count):
     return lr
 
 
-def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result=False):
+def update_weights(
+        model: EfficientZeroNet,
+        batch: List[List[ndarray]],
+        optimizer,
+        replay_buffer: ActorHandle,
+        config: AtariConfig,
+        scaler,
+        vis_result: bool = False
+):
     """update models given a batch data
     Parameters
     ----------
@@ -69,7 +76,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     # obs_batch is the observation for hat s_t (predicted hidden states from dynamics function)
     # obs_target_batch is the observations for s_t (hidden states from representation function)
     # to save GPU memory usage, obs_batch_ori contains (stack + unroll steps) frames
-    obs_batch_ori = torch.from_numpy(obs_batch_ori).to(config.device).float() / 255.0
+    obs_batch_ori = torch.from_numpy(copy.deepcopy(obs_batch_ori)).to(config.device).float() / 255.0
     obs_batch = obs_batch_ori[:, 0: config.stacked_observations * config.image_channel, :, :]
     obs_target_batch = obs_batch_ori[:, config.image_channel:, :, :]
 
@@ -79,7 +86,7 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         obs_target_batch = config.transform(obs_target_batch)
 
     # use GPU tensor
-    action_batch = torch.from_numpy(action_batch).to(config.device).unsqueeze(-1).long()
+    action_batch = torch.from_numpy(copy.deepcopy(action_batch)).to(config.device).unsqueeze(-1).long()
     mask_batch = torch.from_numpy(mask_batch).to(config.device).float()
     target_value_prefix = torch.from_numpy(target_value_prefix).to(config.device).float()
     target_value = torch.from_numpy(target_value).to(config.device).float()
@@ -127,7 +134,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
     predicted_value_prefixs = []
     # Note: Following line is just for logging.
     if vis_result:
-        predicted_values, predicted_policies = scaled_value.detach().cpu(), torch.softmax(policy_logits, dim=1).detach().cpu()
+        predicted_values, predicted_policies = scaled_value.detach().cpu(), torch.softmax(policy_logits,
+                                                                                          dim=1).detach().cpu()
 
     # calculate the new priorities for each transition
     value_priority = L1Loss(reduction='none')(scaled_value.squeeze(-1), target_value[:, 0])
@@ -147,7 +155,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         with autocast():
             for step_i in range(config.num_unroll_steps):
                 # unroll with the dynamics function
-                value, value_prefix, policy_logits, hidden_state, reward_hidden = model.recurrent_inference(hidden_state, reward_hidden, action_batch[:, step_i])
+                value, value_prefix, policy_logits, hidden_state, reward_hidden = model.recurrent_inference(
+                    hidden_state, reward_hidden, action_batch[:, step_i])
 
                 beg_index = config.image_channel * step_i
                 end_index = config.image_channel * (step_i + config.stacked_observations)
@@ -155,7 +164,8 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
                 # consistency loss
                 if config.consistency_coeff > 0:
                     # obtain the oracle hidden states from representation function
-                    _, _, _, presentation_state, _ = model.initial_inference(obs_target_batch[:, beg_index:end_index, :, :])
+                    _, _, _, presentation_state, _ = model.initial_inference(
+                        obs_target_batch[:, beg_index:end_index, :, :])
                     # no grad for the presentation_state branch
                     dynamic_proj = model.project(hidden_state, with_grad=True)
                     observation_proj = model.project(presentation_state, with_grad=False)
@@ -179,9 +189,11 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
                     scaled_value_prefixs = config.inverse_reward_transform(value_prefix.detach())
                     scaled_value_prefixs_cpu = scaled_value_prefixs.detach().cpu()
 
-                    predicted_values = torch.cat((predicted_values, config.inverse_value_transform(value).detach().cpu()))
+                    predicted_values = torch.cat(
+                        (predicted_values, config.inverse_value_transform(value).detach().cpu()))
                     predicted_value_prefixs.append(scaled_value_prefixs_cpu)
-                    predicted_policies = torch.cat((predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
+                    predicted_policies = torch.cat(
+                        (predicted_policies, torch.softmax(policy_logits, dim=1).detach().cpu()))
                     state_lst = np.concatenate((state_lst, hidden_state.detach().cpu().numpy()))
 
                     key = 'unroll_' + str(step_i + 1) + '_l1'
@@ -194,15 +206,21 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
 
                     other_loss[key] = metric_loss(scaled_value_prefixs_cpu, target_value_prefix_base)
                     if value_prefix_indices_1.any():
-                        other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1], target_value_prefix_base[value_prefix_indices_1])
+                        other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1],
+                                                             target_value_prefix_base[value_prefix_indices_1])
                     if value_prefix_indices_n1.any():
-                        other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1], target_value_prefix_base[value_prefix_indices_n1])
+                        other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1],
+                                                              target_value_prefix_base[value_prefix_indices_n1])
                     if value_prefix_indices_0.any():
-                        other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0], target_value_prefix_base[value_prefix_indices_0])
+                        other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0],
+                                                             target_value_prefix_base[value_prefix_indices_0])
     else:
         for step_i in range(config.num_unroll_steps):
             # unroll with the dynamics function
-            value, value_prefix, policy_logits, hidden_state, reward_hidden = model.recurrent_inference(hidden_state, reward_hidden, action_batch[:, step_i])
+            value, value_prefix, policy_logits, hidden_state, reward_hidden = model.recurrent_inference(hidden_state,
+                                                                                                        reward_hidden,
+                                                                                                        action_batch[:,
+                                                                                                        step_i])
 
             beg_index = config.image_channel * step_i
             end_index = config.image_channel * (step_i + config.stacked_observations)
@@ -249,11 +267,14 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
 
                 other_loss[key] = metric_loss(scaled_value_prefixs_cpu, target_value_prefix_base)
                 if value_prefix_indices_1.any():
-                    other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1], target_value_prefix_base[value_prefix_indices_1])
+                    other_loss[key + '_1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_1],
+                                                         target_value_prefix_base[value_prefix_indices_1])
                 if value_prefix_indices_n1.any():
-                    other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1], target_value_prefix_base[value_prefix_indices_n1])
+                    other_loss[key + '_-1'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_n1],
+                                                          target_value_prefix_base[value_prefix_indices_n1])
                 if value_prefix_indices_0.any():
-                    other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0], target_value_prefix_base[value_prefix_indices_0])
+                    other_loss[key + '_0'] = metric_loss(scaled_value_prefixs_cpu[value_prefix_indices_0],
+                                                         target_value_prefix_base[value_prefix_indices_0])
     # ----------------------------------------------------------------------------------
     # weighted loss with masks (some invalid states which are out of trajectory.)
     loss = (config.consistency_coeff * consistency_loss + config.policy_loss_coeff * policy_loss +
@@ -309,14 +330,18 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         predicted_value_prefixs = predicted_value_prefixs.reshape(-1).unsqueeze(-1)
         other_loss['l1'] = metric_loss(predicted_value_prefixs, target_value_prefix_base)
         if value_prefix_indices_1.any():
-            other_loss['l1_1'] = metric_loss(predicted_value_prefixs[value_prefix_indices_1], target_value_prefix_base[value_prefix_indices_1])
+            other_loss['l1_1'] = metric_loss(predicted_value_prefixs[value_prefix_indices_1],
+                                             target_value_prefix_base[value_prefix_indices_1])
         if value_prefix_indices_n1.any():
-            other_loss['l1_-1'] = metric_loss(predicted_value_prefixs[value_prefix_indices_n1], target_value_prefix_base[value_prefix_indices_n1])
+            other_loss['l1_-1'] = metric_loss(predicted_value_prefixs[value_prefix_indices_n1],
+                                              target_value_prefix_base[value_prefix_indices_n1])
         if value_prefix_indices_0.any():
-            other_loss['l1_0'] = metric_loss(predicted_value_prefixs[value_prefix_indices_0], target_value_prefix_base[value_prefix_indices_0])
+            other_loss['l1_0'] = metric_loss(predicted_value_prefixs[value_prefix_indices_0],
+                                             target_value_prefix_base[value_prefix_indices_0])
 
         td_data = (new_priority, target_value_prefix.detach().cpu().numpy(), target_value.detach().cpu().numpy(),
-                   transformed_target_value_prefix.detach().cpu().numpy(), transformed_target_value.detach().cpu().numpy(),
+                   transformed_target_value_prefix.detach().cpu().numpy(),
+                   transformed_target_value.detach().cpu().numpy(),
                    target_value_prefix_phi.detach().cpu().numpy(), target_value_phi.detach().cpu().numpy(),
                    predicted_value_prefixs.detach().cpu().numpy(), predicted_values.detach().cpu().numpy(),
                    target_policy.detach().cpu().numpy(), predicted_policies.detach().cpu().numpy(), state_lst,
@@ -326,6 +351,16 @@ def update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_r
         td_data, priority_data = None, None
 
     return loss_data, td_data, priority_data, scaler
+
+
+def wait_for_batch(batch_storage) -> Any:
+    while True:
+        batch = batch_storage.pop()
+
+        if batch is not None:
+            return batch
+
+        time.sleep(0.3)
 
 
 def _train(model, target_model, replay_buffer, shared_storage, batch_storage, config, summary_writer):
@@ -386,54 +421,68 @@ def _train(model, target_model, replay_buffer, shared_storage, batch_storage, co
                 training_step_span.set_attribute("step_count", step_count)
 
                 # remove data if the replay buffer is full. (more data settings)
-                if step_count > 0 and step_count % 1000 == 0:
+                if step_count % 1000 == 0:
                     replay_buffer.remove_to_fit.remote()
 
                 # obtain a batch
-                batch = batch_storage.pop()
-                if batch is None:
-                    time.sleep(0.3)
-                    continue
+                with module_tracer.start_as_current_span("waiting for a batch to process"):
+                    batch = wait_for_batch(batch_storage)
+
+                training_step_span.add_event('batch received from queue')
+
                 shared_storage.incr_counter.remote()
                 lr = adjust_lr(config, optimizer, step_count)
 
                 # update model for self-play
                 if step_count % config.checkpoint_interval == 0:
-                    shared_storage.set_weights.remote(model.get_weights())
+                    with module_tracer.start_as_current_span("update model for self-play"):
+                        shared_storage.set_weights.remote(model.get_weights())
 
                 # update model for reanalyzing
                 if step_count % config.target_model_interval == 0:
-                    shared_storage.set_target_weights.remote(recent_weights)
-                    recent_weights = model.get_weights()
+                    with module_tracer.start_as_current_span("update model for reanalyzing"):
+                        shared_storage.set_target_weights.remote(recent_weights)
+                        recent_weights = model.get_weights()
 
                 if step_count % config.vis_interval == 0:
                     vis_result = True
                 else:
                     vis_result = False
 
-                if config.amp_type == 'torch_amp':
-                    log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
-                    scaler = log_data[3]
-                else:
-                    log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
+                with module_tracer.start_as_current_span("update weights"):
+                    if config.amp_type == 'torch_amp':
+                        log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
+                        scaler = log_data[3]
+                    else:
+                        log_data = update_weights(model, batch, optimizer, replay_buffer, config, scaler, vis_result)
 
                 if step_count % config.log_interval == 0:
-                    _log(config, step_count, log_data[0:3], model, replay_buffer, lr, shared_storage, summary_writer, vis_result)
+                    with module_tracer.start_as_current_span("log at step count"):
+                        _log(config, step_count, log_data[0:3], model, replay_buffer, lr, shared_storage,
+                             summary_writer, vis_result)
 
                 # The queue is empty.
                 if step_count >= 100 and step_count % 50 == 0 and batch_storage.get_len() == 0:
+                    training_step_span.set_status(
+                        Status(
+                            StatusCode.ERROR,
+                            'Warning: Batch Queue is empty (Require more batch actors Or batch actor fails).'
+                        )
+                    )
                     print('Warning: Batch Queue is empty (Require more batch actors Or batch actor fails).')
 
                 step_count += 1
 
                 # save models
                 if step_count % config.save_ckpt_interval == 0:
-                    model_path = os.path.join(config.model_dir, 'model_{}.p'.format(step_count))
-                    torch.save(model.state_dict(), model_path)
+                    with module_tracer.start_as_current_span("save the model"):
+                        model_path = os.path.join(config.model_dir, 'model_{}.p'.format(step_count))
+                        torch.save(model.state_dict(), model_path)
 
-    shared_storage.set_weights.remote(model.get_weights())
-    time.sleep(30)
-    return model.get_weights()
+    with module_tracer.start_as_current_span("get final weights"):
+        shared_storage.set_weights.remote(model.get_weights())
+        time.sleep(30)
+        return model.get_weights()
 
 
 def train(config, summary_writer, actors: RayActors, model, target_model, model_path=None):
@@ -453,11 +502,16 @@ def train(config, summary_writer, actors: RayActors, model, target_model, model_
         model.load_state_dict(weights)
         target_model.load_state_dict(weights)
 
-    training_context = {}
-    inject(training_context)
-
     # training loop
-    final_weights = _train(model, target_model, actors.remote_replay_buffer, actors.remote_storage, actors.remote_batch_storage, config, summary_writer)
+    final_weights = _train(
+        model,
+        target_model,
+        actors.remote_replay_buffer,
+        actors.remote_storage,
+        actors.remote_batch_storage,
+        config,
+        summary_writer
+    )
 
     ray.wait(actors.remote_workers)
     print('Training over...')

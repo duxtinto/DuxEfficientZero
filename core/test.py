@@ -1,55 +1,75 @@
 import os
+import time
 from typing import Optional
 
-import ray
-import time
-import torch
-
-import numpy as np
 import core.ctree.cytree as cytree
+import numpy as np
+import ray
+import torch
 from opentelemetry.context import Context
-
-from tqdm.auto import tqdm
 from torch.cuda.amp import autocast as autocast
-from core.mcts import MCTS
+from tqdm.auto import tqdm
+
+from __refactored__.tracing.opentelemetry import make_tracer_provider
 from core.game import GameHistory
+from core.mcts import MCTS
 from core.utils import select_action, prepare_observation_lst
 
 
+def wait_for_next_event(shared_storage, config, episodes, service_tracer) -> int:
+    with service_tracer.start_as_current_span("Waiting for next test interval") as span:
+        while True:
+            counter = ray.get(shared_storage.get_counter.remote())
+
+            if counter >= config.training_steps + config.last_steps:
+                return counter
+
+            if counter >= config.test_interval * episodes:
+                return counter
+
+            span.add_event('counter {}: sleeping for 30 secs...'.format(counter))
+            time.sleep(30)
+
 @ray.remote
-def _test(config, shared_storage, _ray_trace_ctx: Optional[Context]):
+def _test(config, shared_storage, _ray_trace_ctx: Optional[Context] = None):
+    tracer_provider = make_tracer_provider("smartfighters-efficientZero-test-method")
+    service_tracer = tracer_provider.get_tracer(__name__)
+
     test_model = config.get_uniform_network()
     best_test_score = float('-inf')
     episodes = 0
     while True:
-        counter = ray.get(shared_storage.get_counter.remote())
+        counter = wait_for_next_event(shared_storage, config, episodes, service_tracer)
+
         if counter >= config.training_steps + config.last_steps:
-            time.sleep(30)
-            break
+            with service_tracer.start_as_current_span("stop testing"):
+                time.sleep(30)
+                break
+
         if counter >= config.test_interval * episodes:
-            episodes += 1
-            test_model.set_weights(ray.get(shared_storage.get_weights.remote()))
-            test_model.eval()
+            with service_tracer.start_as_current_span("log progress"):
+                episodes += 1
+                test_model.set_weights(ray.get(shared_storage.get_weights.remote()))
+                test_model.eval()
 
-            test_score, _ = test(config, test_model, counter, config.test_episodes, config.device, False, save_video=False)
-            mean_score = test_score.mean()
-            std_score = test_score.std()
-            print('Start evaluation at step {}.'.format(counter))
-            if mean_score >= best_test_score:
-                best_test_score = mean_score
-                torch.save(test_model.state_dict(), config.model_path)
+                test_score, _ = test(config, test_model, counter, config.test_episodes, config.device, False,
+                                     save_video=False)
+                mean_score = test_score.mean()
+                std_score = test_score.std()
+                print('Start evaluation at step {}.'.format(counter))
+                if mean_score >= best_test_score:
+                    best_test_score = mean_score
+                    torch.save(test_model.state_dict(), config.model_path)
 
-            test_log = {
-                'mean_score': mean_score,
-                'std_score': std_score,
-                'max_score': test_score.max(),
-                'min_score': test_score.min(),
-            }
+                test_log = {
+                    'mean_score': mean_score,
+                    'std_score': std_score,
+                    'max_score': test_score.max(),
+                    'min_score': test_score.min(),
+                }
 
-            shared_storage.add_test_log.remote(counter, test_log)
-            print('Step {}, test scores: \n{}'.format(counter, test_score))
-
-        time.sleep(30)
+                shared_storage.add_test_log.remote(counter, test_log)
+                print('Step {}, test scores: \n{}'.format(counter, test_score))
 
 
 def test(config, model, counter, test_episodes, device, render, save_video=False, final_test=False, use_pb=False):
@@ -83,7 +103,7 @@ def test(config, model, counter, test_episodes, device, render, save_video=False
     with torch.no_grad():
         # new games
         envs = [config.new_game(seed=i, save_video=save_video, save_path=save_path, test=True, final_test=final_test,
-                              video_callable=lambda episode_id: True, uid=i) for i in range(test_episodes)]
+                                video_callable=lambda episode_id: True, uid=i) for i in range(test_episodes)]
         # initializations
         init_obses = [env.reset() for env in envs]
         dones = np.array([False for _ in range(test_episodes)])

@@ -33,12 +33,15 @@ if __name__ == '__main__':
 
             runtime_env = {
                 'working_dir': '.',
+                'pip': "./requirements.txt",
             }
 
             ray.init(
                 runtime_env=runtime_env,
                 namespace="dux-efficient-zero",
-                logging_level=logging.DEBUG)
+                logging_level=logging.DEBUG,
+                _tracing_startup_hook='__refactored__.tracing.opentelemetry:setup_ray_tracing',
+            )
 
             # seeding random iterators
             set_seed(args.seed)
@@ -70,8 +73,12 @@ if __name__ == '__main__':
                         model_path = None
                     model = game_config.get_uniform_network()
                     target_model = game_config.get_uniform_network()
+
                     with module_tracer.start_as_current_span("deploying actors to the cluster"):
                         ray_actors = RayActors(game_config, model, target_model)
+                    with module_tracer.start_as_current_span("run ray remote workers"):
+                        ray_actors.run_remote_workers()
+
                     model, weights = train(game_config, summary_writer, ray_actors, model, target_model, model_path)
                     model.set_weights(weights)
                     total_steps = game_config.training_steps + game_config.last_steps

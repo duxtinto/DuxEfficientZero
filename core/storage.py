@@ -1,10 +1,15 @@
-import ray
+from typing import Optional
 
-from ray.util.queue import Queue
-import pydevd_pycharm
+import ray
+from opentelemetry.context import Context
+from opentelemetry.trace import Status, StatusCode
+
+from __refactored__.queue.queue import Queue
+from __refactored__.tracing.opentelemetry import make_tracer_provider
+
 
 class QueueStorage(object):
-    def __init__(self, threshold=15, size=20):
+    def __init__(self, name='', threshold=15, size=20):
         """Queue storage
         Parameters
         ----------
@@ -15,20 +20,46 @@ class QueueStorage(object):
         """
         # pydevd_pycharm.settrace('localhost', port=5674, stdoutToServer=True, stderrToServer=True)
 
+        # name = random.choices(string.ascii_lowercase + string.digits, k=5)
+        self.name = name
         self.threshold = threshold
         self.queue = Queue(maxsize=size)
 
-    def push(self, batch):
-        if self.queue.qsize() <= self.threshold:
+    def push(self, batch, _ray_trace_ctx: Optional[Context] = None):
+        tracer_provider = make_tracer_provider("smartfighters-efficientZero-{}-queue-storage".format(self.name))
+        service_tracer = tracer_provider.get_tracer(__name__)
+
+        with service_tracer.start_as_current_span("trying to push batch to queue") as span:
+            num_elements = self.queue.qsize()
+            is_queue_full = num_elements > self.threshold
+
+            span.set_attributes({
+                'sf.queue.is_full': is_queue_full,
+                'num_elements': num_elements
+            })
+
+            if is_queue_full:
+                span.set_status(Status(StatusCode.ERROR, 'queue is full'))
+                span.set_attribute('sf.queue.num_elements', num_elements)
+                return
+
             self.queue.put(batch)
 
-    def pop(self):
-        if self.queue.qsize() > 0:
-            return self.queue.get()
-        else:
-            return None
+    def pop(self, _ray_trace_ctx: Optional[Context] = None):
+        tracer_provider = make_tracer_provider("smartfighters-efficientZero-{}-queue-storage".format(self.name))
+        service_tracer = tracer_provider.get_tracer(__name__)
 
-    def get_len(self):
+        with service_tracer.start_as_current_span("trying to pop batch from queue") as span:
+            is_queue_empty = self.queue.qsize() <= 0
+
+            span.set_attribute('sf.queue.is_empty', is_queue_empty)
+
+            if is_queue_empty:
+                return None
+
+            return self.queue.get()
+
+    def get_len(self, _ray_trace_ctx: Optional[Context] = None):
         return self.queue.qsize()
 
 
@@ -44,6 +75,9 @@ class SharedStorage(object):
             models for reanalyzing (update every target_model_interval)
         """
         # pydevd_pycharm.settrace('localhost', port=5674, stdoutToServer=True, stderrToServer=True)
+
+        self.tracer_provider = make_tracer_provider("smartfighters-efficientZero-shared-storage")
+        self.service_tracer = self.tracer_provider.get_tracer(__name__)
 
         self.step_counter = 0
         self.test_counter = 0
@@ -85,7 +119,8 @@ class SharedStorage(object):
     def get_counter(self):
         return self.step_counter
 
-    def set_data_worker_logs(self, eps_len, eps_len_max, eps_ori_reward, eps_reward, eps_reward_max, temperature, visit_entropy, priority_self_play, distributions):
+    def set_data_worker_logs(self, eps_len, eps_len_max, eps_ori_reward, eps_reward, eps_reward_max, temperature,
+                             visit_entropy, priority_self_play, distributions):
         self.eps_lengths.append(eps_len)
         self.eps_lengths_max.append(eps_len_max)
         self.ori_reward_log.append(eps_ori_reward)

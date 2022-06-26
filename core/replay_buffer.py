@@ -1,40 +1,84 @@
-import ray
+import copy
 import time
+from typing import Optional
 
 import numpy as np
-import pydevd_pycharm
+import ray
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import Tracer
+from ray._raylet import ObjectRef
+
+from __refactored__.contracts.TerminableActorInterface import TerminableActorInterface
+from __refactored__.replay_buffer.ReplayBufferCachedData import ReplayBufferCachedData
+from __refactored__.tracing.opentelemetry import make_tracer_provider
+
 
 @ray.remote
-class ReplayBuffer(object):
+class ReplayBuffer(TerminableActorInterface):
     """Reference : DISTRIBUTED PRIORITIZED EXPERIENCE REPLAY
     Algo. 1 and Algo. 2 in Page-3 of (https://arxiv.org/pdf/1803.00933.pdf
     """
-    def __init__(self, config=None):
-        # pydevd_pycharm.settrace('localhost', port=5674, stdoutToServer=True, stderrToServer=True)
+    tracer_provider: TracerProvider
+    service_tracer: Tracer
 
-        self.config = config
-        self.batch_size = config.batch_size
-        self.keep_ratio = 1
+    def __init__(self, config=None, cached_data: Optional[ReplayBufferCachedData] = None):
+        # pydevd_pycharm.settrace('localhost', port=5676, stdoutToServer=True, stderrToServer=True)
 
-        self.model_index = 0
-        self.model_update_interval = 10
+        self.tracer_provider = make_tracer_provider("smartfighters-efficientZero-replay-buffer")
+        self.service_tracer = self.tracer_provider.get_tracer(__name__)
 
-        self.buffer = []
-        self.priorities = []
-        self.game_look_up = []
+        with self.service_tracer.start_as_current_span("Initialize replay buffer"):
+            use_cached_data: bool = False if cached_data is None else True
 
-        self._eps_collected = 0
-        self.base_idx = 0
-        self._alpha = config.priority_prob_alpha
-        self.transition_top = int(config.transition_num * 10 ** 6)
-        self.clear_time = 0
+            self.config = config
+            self.batch_size = config.batch_size
+            self.keep_ratio = 1
+
+            self.model_index = 0
+            self.model_update_interval = 10
+
+            self.buffer = cached_data.buffer if use_cached_data else []
+            self.priorities = copy.deepcopy(cached_data.priorities) if use_cached_data else []
+            self.game_look_up = cached_data.game_look_up if use_cached_data else []
+
+            self._eps_collected = cached_data.eps_collected if use_cached_data else 0
+            self.base_idx = cached_data.base_idx if use_cached_data else 0
+            self._alpha = config.priority_prob_alpha
+            self.transition_top = int(config.transition_num * 10 ** 6)
+            self.clear_time = cached_data.clear_time if use_cached_data else 0
+
+    def terminate(self):
+        # pickle.dump(self, open("save.p", "wb"))
+        pass
+
+    def get_data_to_cache(self) -> ReplayBufferCachedData:
+        cached_buffer = []
+
+        for game_history in self.buffer:
+            cached_game_history = copy.deepcopy(game_history)
+            cached_game_history.obs_history = ray.get(game_history.obs_history) \
+                if isinstance(game_history.obs_history, ObjectRef) \
+                else game_history.obs_history
+
+            cached_buffer.append(cached_game_history)
+
+        return ReplayBufferCachedData(
+            cached_buffer,
+            # self.buffer,
+            self.priorities,
+            self.game_look_up,
+            self._eps_collected,
+            self.base_idx,
+            self.clear_time
+        )
 
     def save_pools(self, pools, gap_step):
-        # save a list of game histories
-        for (game, priorities) in pools:
-            # Only append end game
-            # if end_tag:
-            self.save_game(game, True, gap_step, priorities)
+        with self.service_tracer.start_as_current_span("save a list of game histories"):
+            # save a list of game histories
+            for (game, priorities) in pools:
+                # Only append end game
+                # if end_tag:
+                self.save_game(game, True, gap_step, priorities)
 
     def save_game(self, game, end_tag, gap_steps, priorities=None):
         """Save a game history block
@@ -49,33 +93,37 @@ class ReplayBuffer(object):
         priorities: list
             the priorities corresponding to the transitions in the game history
         """
-        if self.get_total_len() >= self.config.total_transitions:
-            return
+        with self.service_tracer.start_as_current_span("save a game history block"):
+            if self.get_total_len() >= self.config.total_transitions:
+                with self.service_tracer.start_as_current_span("the replay buffer is full"):
+                    return
 
-        if end_tag:
-            self._eps_collected += 1
-            valid_len = len(game)
-        else:
-            valid_len = len(game) - gap_steps
+            if end_tag:
+                self._eps_collected += 1
+                valid_len = len(game)
+            else:
+                valid_len = len(game) - gap_steps
 
-        if priorities is None:
-            max_prio = self.priorities.max() if self.buffer else 1
-            self.priorities = np.concatenate((self.priorities, [max_prio for _ in range(valid_len)] + [0. for _ in range(valid_len, len(game))]))
-        else:
-            assert len(game) == len(priorities), " priorities should be of same length as the game steps"
-            priorities = priorities.copy().reshape(-1)
-            # priorities[valid_len:len(game)] = 0.
-            self.priorities = np.concatenate((self.priorities, priorities))
+            if priorities is None:
+                max_prio = self.priorities.max() if self.buffer else 1
+                self.priorities = np.concatenate(
+                    (self.priorities, [max_prio for _ in range(valid_len)] + [0. for _ in range(valid_len, len(game))]))
+            else:
+                assert len(game) == len(priorities), " priorities should be of same length as the game steps"
+                priorities = priorities.copy().reshape(-1)
+                # priorities[valid_len:len(game)] = 0.
+                self.priorities = np.concatenate((self.priorities, priorities))
 
-        self.buffer.append(game)
-        self.game_look_up += [(self.base_idx + len(self.buffer) - 1, step_pos) for step_pos in range(len(game))]
+            self.buffer.append(game)
+            self.game_look_up += [(self.base_idx + len(self.buffer) - 1, step_pos) for step_pos in range(len(game))]
 
     def get_game(self, idx):
-        # return a game
-        game_id, game_pos = self.game_look_up[idx]
-        game_id -= self.base_idx
-        game = self.buffer[game_id]
-        return game
+        with self.service_tracer.start_as_current_span("get game from replay buffer"):
+            # return a game
+            game_id, game_pos = self.game_look_up[idx]
+            game_id -= self.base_idx
+            game = self.buffer[game_id]
+            return game
 
     def prepare_batch_context(self, batch_size, beta):
         """Prepare a batch context that contains:
@@ -91,41 +139,43 @@ class ReplayBuffer(object):
         beta: float
             the parameter in PER for calculating the priority
         """
-        assert beta > 0
+        with self.service_tracer.start_as_current_span("prepare a replay buffer batch context"):
+            assert beta > 0
 
-        total = self.get_total_len()
+            total = self.get_total_len()
 
-        probs = self.priorities ** self._alpha
+            probs = self.priorities ** self._alpha
 
-        probs /= probs.sum()
-        # sample data
-        indices_lst = np.random.choice(total, batch_size, p=probs, replace=False)
+            probs /= probs.sum()
+            # sample data
+            indices_lst = np.random.choice(total, batch_size, p=probs, replace=False)
 
-        weights_lst = (total * probs[indices_lst]) ** (-beta)
-        weights_lst /= weights_lst.max()
+            weights_lst = (total * probs[indices_lst]) ** (-beta)
+            weights_lst /= weights_lst.max()
 
-        game_lst = []
-        game_pos_lst = []
+            game_lst = []
+            game_pos_lst = []
 
-        for idx in indices_lst:
-            game_id, game_pos = self.game_look_up[idx]
-            game_id -= self.base_idx
-            game = self.buffer[game_id]
+            for idx in indices_lst:
+                game_id, game_pos = self.game_look_up[idx]
+                game_id -= self.base_idx
+                game = self.buffer[game_id]
 
-            game_lst.append(game)
-            game_pos_lst.append(game_pos)
+                game_lst.append(game)
+                game_pos_lst.append(game_pos)
 
-        make_time = [time.time() for _ in range(len(indices_lst))]
+            make_time = [time.time() for _ in range(len(indices_lst))]
 
-        context = (game_lst, game_pos_lst, indices_lst, weights_lst, make_time)
-        return context
+            context = (game_lst, game_pos_lst, indices_lst, weights_lst, make_time)
+            return context
 
     def update_priorities(self, batch_indices, batch_priorities, make_time):
-        # update the priorities for data still in replay buffer
-        for i in range(len(batch_indices)):
-            if make_time[i] > self.clear_time:
-                idx, prio = batch_indices[i], batch_priorities[i]
-                self.priorities[idx] = prio
+        with self.service_tracer.start_as_current_span("update priorities"):
+            # update the priorities for data still in replay buffer
+            for i in range(len(batch_indices)):
+                if make_time[i] > self.clear_time:
+                    idx, prio = batch_indices[i], batch_priorities[i]
+                    self.priorities[idx] = prio
 
     def remove_to_fit(self):
         # remove some old data if the replay buffer is full.
@@ -140,17 +190,21 @@ class ReplayBuffer(object):
                     break
 
             if total_transition >= self.config.batch_size:
-                self._remove(index + 1)
+                with self.service_tracer.start_as_current_span("the replay buffer is full => remove some old data"):
+                    self._remove(index + 1)
 
     def _remove(self, num_excess_games):
-        # delete game histories
-        excess_games_steps = sum([len(game) for game in self.buffer[:num_excess_games]])
-        del self.buffer[:num_excess_games]
-        self.priorities = self.priorities[excess_games_steps:]
-        del self.game_look_up[:excess_games_steps]
-        self.base_idx += num_excess_games
+        with self.service_tracer.start_as_current_span("remove game histories") as span:
+            # delete game histories
+            excess_games_steps = sum([len(game) for game in self.buffer[:num_excess_games]])
+            del self.buffer[:num_excess_games]
+            self.priorities = self.priorities[excess_games_steps:]
+            del self.game_look_up[:excess_games_steps]
+            self.base_idx += num_excess_games
 
-        self.clear_time = time.time()
+            self.clear_time = time.time()
+
+            span.set_attributes({'excess_games_steps': excess_games_steps})
 
     def clear_buffer(self):
         del self.buffer[:]
